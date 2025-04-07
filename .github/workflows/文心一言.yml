@@ -5,72 +5,91 @@ on:
     branches:
       - main
   schedule:
-    # Runs everyday at 1:00 AM
     - cron: "0 1 * * *"
 
 permissions:
   contents: write
+  security-events: write  # 添加安全事件写入权限
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # 添加超时限制
 
     steps:
       - name: Check out the code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整检出历史记录
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "latest"
+          node-version: "18.x"  # 锁定LTS版本
+          cache: 'npm'
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
 
       - name: Install dependencies
-        run: |
-          npm install -g javascript-obfuscator
+        run: npm ci  # 使用更严格的依赖安装
 
-      - name: Clone BPB workjs
-        id: download
-        run: |
-          wget -O origin.js https://raw.githubusercontent.com/bia-pain-bache/BPB-Worker-Panel/main/build/unobfuscated-worker.js || exit 1
+      - name: Install Obfuscator
+        run: npm install -g javascript-obfuscator
 
-      - name: Validate downloaded file
+      - name: Verify BPB Worker Source
         run: |
-          if [ ! -f origin.js ]; then
-            echo "Error: origin.js not downloaded successfully."
-            exit 1
-          fi
+          wget -O origin.js https://raw.githubusercontent.com/bia-pain-bache/BPB-Worker-Panel/main/build/unobfuscated-worker.js
+          echo "$(sha256sum origin.js)"  # 输出校验和供审计
 
-      - name: Obfuscate BPB worker js
-        id: obfuscate
+      - name: Obfuscate BPB Worker
         run: |
-          javascript-obfuscator origin.js --output _worker.js \
-          --compact true \
-          --control-flow-flattening true \
-          --control-flow-flattening-threshold 0.5 \
-          --dead-code-injection false \
-          --identifier-names-generator hexadecimal \
-          --rename-globals true \
-          --string-array true \
-          --string-array-encoding 'base64' \
-          --transform-object-keys true \
-          --unicode-escape-sequence true || exit 1
+          javascript-obfuscator origin.js \
+            --output _worker.js \
+            --compact true \
+            --control-flow-flattening true \
+            --control-flow-flattening-threshold 0.75 \
+            --dead-code-injection true \
+            --dead-code-injection-threshold 0.75 \
+            --identifier-names-generator hexadecimal \
+            --rename-globals true \
+            --string-array true \
+            --string-array-encoding 'rc4' \
+            --string-array-threshold 0.75 \
+            --string-array-wrappers-count 3 \
+            --string-array-wrappers-chained true \
+            --transform-object-keys true \
+            --unicode-escape-sequence true \
+            --domain-lock 'github.com'  # 添加域名锁定
 
-      - name: Check for changes
-        id: changes
-        run: |
-          if git diff --quiet _worker.js; then
-            echo "No changes detected in _worker.js"
-            echo "::set-output name=has_changes::false"
-          else
-            echo "Changes detected in _worker.js"
-            echo "::set-output name=has_changes::true"
-          fi
+      - name: Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'node:18-alpine'  # 扫描基础镜像
+          format: 'table'
 
-      - name: Commit changes
-        if: steps.changes.outputs.has_changes == 'true'
+      - name: Commit Changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           branch: main
-          commit_message: ':arrow_up: update latest bpb panel'
+          commit_message: ':lock: Automated security update [skip ci]'
           commit_author: 'github-actions[bot] <github-actions[bot]@users.noreply.github.com>'
-          push_options: '--set-upstream'
+          push_options: '--force'  # 强制推送防止冲突
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}  # 使用加密的PAT
+
+      - name: Cleanup Artifacts
+        run: |
+          rm -f origin.js
+          npm cache clean --force
+
+      - name: Build Duration Alert
+        if: always()
+        uses: robertdebock/build-duration-alert-action@v2
+        with:
+          threshold: 1200  # 20分钟警告阈值
